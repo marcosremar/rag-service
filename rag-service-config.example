@@ -1,0 +1,55 @@
+# RAG Service Configuration Example
+# Copy this to your .env file and adjust as needed
+
+# ===========================================
+# RAG SERVICE CONFIGURATION
+# ===========================================
+
+# RAG Settings
+RAG_TOP_K=5
+RAG_SIMILARITY_THRESHOLD=0.6
+
+# Embedding Configuration
+EMBEDDING_LLM_MODEL=openai/text-embedding-3-small
+EMBEDDING_TYPE=openai
+EMBEDDING_BACKEND=api
+
+# Vector Database
+VECTOR_DATABASE=qdrant
+QDRANT_URL=http://54.37.225.188:6333
+QDRANT_COLLECTION=code_examples
+
+# OpenRouter (Required for embeddings)
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+
+# ===========================================
+# ALTERNATIVE EMBEDDING MODELS
+# ===========================================
+
+# For code-specific embeddings (recommended)
+# EMBEDDING_LLM_MODEL=voyageai/voyage-code-2
+# EMBEDDING_TYPE=voyage
+
+# For best quality (more expensive)
+# EMBEDDING_LLM_MODEL=openai/text-embedding-3-large
+# EMBEDDING_TYPE=openai
+
+# For local embeddings (free, no API key needed)
+# EMBEDDING_BACKEND=local
+# EMBEDDING_LLM_MODEL=BAAI/bge-small-en-v1.5
+
+# ===========================================
+# ALTERNATIVE VECTOR DATABASES
+# ===========================================
+
+# For LanceDB instead of Qdrant
+# VECTOR_DATABASE=lancedb
+# LANCEDB_PATH=./data/lancedb
+
+# ===========================================
+# DEVELOPMENT SETTINGS
+# ===========================================
+
+LOG_LEVEL=info
+NODE_ENV=production
