@@ -112,3 +112,4 @@ import { CodeGraphService } from '@lightweight-code-agent/code-graph';
 3. **Fase 3**: Separar LSP em serviço próprio quando necessário
 
 
+

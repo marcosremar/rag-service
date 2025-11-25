@@ -87,3 +87,4 @@ rag-service/src/
 Isso facilita a separação futura sem grandes refatorações.
 
 
+
