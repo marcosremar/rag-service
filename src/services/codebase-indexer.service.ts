@@ -17,10 +17,10 @@ import { join, relative, extname, dirname } from 'path';
 import { Database } from 'bun:sqlite';
 import { logger } from '../utils/logger.js';
 import { EmbeddingService } from './embedding.service.js';
-import { ASTCodeChunker} from './chunking/ast-chunker.service.js';
-import type { Language } from './chunking/types.js';
+import { CodeGraphService } from './code-graph.service.js';
 import { glob } from 'glob';
 import ignore from 'ignore';
+import type { IConfigurationService } from '../config/index.js';
 
 interface IndexStats {
   totalFiles: number;
@@ -29,10 +29,21 @@ interface IndexStats {
   indexDuration: number;
 }
 
+type Language = 'typescript' | 'javascript' | 'python' | 'unknown';
+
+interface CodeChunk {
+  code: string;
+  startLine: number;
+  endLine: number;
+  type: string;
+  name?: string;
+  language: Language;
+}
+
 export class CodebaseIndexerService {
   private db: Database;
   private embeddingService: EmbeddingService;
-  private chunker: ASTCodeChunker;
+  private codeGraph: CodeGraphService;
   private projectRoot: string;
   private watcher: FSWatcher | null = null;
   private ignoreFilter: ReturnType<typeof ignore> | null = null;
@@ -46,13 +57,18 @@ export class CodebaseIndexerService {
     '.ts', '.tsx', '.js', '.jsx', '.py'
   ]);
 
-  constructor(projectRoot?: string) {
+  constructor(projectRoot?: string, config?: IConfigurationService) {
     this.projectRoot = projectRoot || process.cwd();
     this.enableAutoIndex = process.env.ENABLE_CODEBASE_INDEX !== 'false';
 
-    // Initialize services
-    this.embeddingService = new EmbeddingService();
-    this.chunker = new ASTCodeChunker();
+    // Initialize services with config (so EmbeddingService gets OPENROUTER_API_KEY)
+    this.embeddingService = new EmbeddingService(config);
+    this.codeGraph = new CodeGraphService(this.projectRoot);
+    
+    // Initialize code graph asynchronously
+    this.codeGraph.initialize().catch(error => {
+      logger.error({ error }, 'Failed to initialize Code Graph');
+    });
 
     // Initialize database
     const dbPath = join(this.projectRoot, 'data', 'codebase-index.db');
@@ -107,6 +123,22 @@ export class CodebaseIndexerService {
       CREATE INDEX IF NOT EXISTS idx_language ON code_chunks(language);
       CREATE INDEX IF NOT EXISTS idx_chunk_type ON code_chunks(chunk_type);
       CREATE INDEX IF NOT EXISTS idx_last_modified ON code_chunks(last_modified);
+
+      -- Code Graph: Dependencies table
+      CREATE TABLE IF NOT EXISTS dependencies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_file TEXT NOT NULL,
+        target_file TEXT NOT NULL,
+        import_type TEXT NOT NULL,
+        imported_symbols TEXT,
+        line_number INTEGER,
+        created_at INTEGER DEFAULT (unixepoch()),
+        UNIQUE(source_file, target_file, line_number)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_source_file ON dependencies(source_file);
+      CREATE INDEX IF NOT EXISTS idx_target_file ON dependencies(target_file);
+      CREATE INDEX IF NOT EXISTS idx_import_type ON dependencies(import_type);
 
       CREATE TABLE IF NOT EXISTS index_stats (
         id INTEGER PRIMARY KEY DEFAULT 1,
@@ -208,6 +240,184 @@ export class CodebaseIndexerService {
   }
 
   /**
+   * Simple code chunking (basic implementation)
+   * Splits code into functions, classes, and top-level code
+   */
+  private chunkCode(content: string, language: Language): CodeChunk[] {
+    const chunks: CodeChunk[] = [];
+    const lines = content.split('\n');
+
+    if (language === 'typescript' || language === 'javascript') {
+      let currentChunk: { start: number; type: string; name?: string } | null = null;
+      let braceCount = 0;
+      let inFunction = false;
+
+      lines.forEach((line, index) => {
+        const trimmed = line.trim();
+
+        // Detect function/class start
+        const functionMatch = trimmed.match(/(?:export\s+)?(?:async\s+)?(?:function|const|let|var)\s+(\w+)\s*[=:]\s*(?:async\s*)?\(/);
+        const classMatch = trimmed.match(/(?:export\s+)?class\s+(\w+)/);
+        const methodMatch = trimmed.match(/(?:public|private|protected)?\s*(\w+)\s*\(/);
+
+        if (classMatch && !currentChunk) {
+          if (currentChunk) {
+            chunks.push({
+              code: lines.slice(currentChunk.start, index).join('\n'),
+              startLine: currentChunk.start + 1,
+              endLine: index,
+              type: currentChunk.type,
+              name: currentChunk.name,
+              language,
+            });
+          }
+          currentChunk = { start: index, type: 'class', name: classMatch[1] };
+          braceCount = 0;
+        } else if (functionMatch && !currentChunk) {
+          if (currentChunk) {
+            chunks.push({
+              code: lines.slice(currentChunk.start, index).join('\n'),
+              startLine: currentChunk.start + 1,
+              endLine: index,
+              type: currentChunk.type,
+              name: currentChunk.name,
+              language,
+            });
+          }
+          currentChunk = { start: index, type: 'function', name: functionMatch[1] };
+          braceCount = 0;
+          inFunction = true;
+        }
+
+        // Count braces to detect end of function/class
+        braceCount += (line.match(/\{/g) || []).length;
+        braceCount -= (line.match(/\}/g) || []).length;
+
+        if (currentChunk && braceCount === 0 && (trimmed.includes('}') || trimmed === '}')) {
+          chunks.push({
+            code: lines.slice(currentChunk.start, index + 1).join('\n'),
+            startLine: currentChunk.start + 1,
+            endLine: index + 1,
+            type: currentChunk.type,
+            name: currentChunk.name,
+            language,
+          });
+          currentChunk = null;
+          inFunction = false;
+        }
+      });
+
+      // Add remaining chunk if any
+      if (currentChunk) {
+        chunks.push({
+          code: lines.slice(currentChunk.start).join('\n'),
+          startLine: currentChunk.start + 1,
+          endLine: lines.length,
+          type: currentChunk.type,
+          name: currentChunk.name,
+          language,
+        });
+      }
+
+      // If no chunks found, add entire file as one chunk
+      if (chunks.length === 0) {
+        chunks.push({
+          code: content,
+          startLine: 1,
+          endLine: lines.length,
+          type: 'file',
+          language,
+        });
+      }
+    } else if (language === 'python') {
+      let currentChunk: { start: number; type: string; name?: string } | null = null;
+      let indentLevel = 0;
+
+      lines.forEach((line, index) => {
+        const trimmed = line.trim();
+        const currentIndent = line.length - line.trimStart().length;
+
+        // Detect function/class start
+        const functionMatch = trimmed.match(/^def\s+(\w+)\s*\(/);
+        const classMatch = trimmed.match(/^class\s+(\w+)/);
+
+        if (classMatch) {
+          if (currentChunk && currentIndent <= indentLevel) {
+            chunks.push({
+              code: lines.slice(currentChunk.start, index).join('\n'),
+              startLine: currentChunk.start + 1,
+              endLine: index,
+              type: currentChunk.type,
+              name: currentChunk.name,
+              language,
+            });
+          }
+          currentChunk = { start: index, type: 'class', name: classMatch[1] };
+          indentLevel = currentIndent;
+        } else if (functionMatch) {
+          if (currentChunk && currentIndent <= indentLevel) {
+            chunks.push({
+              code: lines.slice(currentChunk.start, index).join('\n'),
+              startLine: currentChunk.start + 1,
+              endLine: index,
+              type: currentChunk.type,
+              name: currentChunk.name,
+              language,
+            });
+          }
+          currentChunk = { start: index, type: 'function', name: functionMatch[1] };
+          indentLevel = currentIndent;
+        } else if (currentChunk && trimmed && currentIndent <= indentLevel && !trimmed.startsWith('#')) {
+          // End of current chunk
+          chunks.push({
+            code: lines.slice(currentChunk.start, index).join('\n'),
+            startLine: currentChunk.start + 1,
+            endLine: index,
+            type: currentChunk.type,
+            name: currentChunk.name,
+            language,
+          });
+          currentChunk = null;
+        }
+      });
+
+      // Add remaining chunk if any
+      if (currentChunk) {
+        chunks.push({
+          code: lines.slice(currentChunk.start).join('\n'),
+          startLine: currentChunk.start + 1,
+          endLine: lines.length,
+          type: currentChunk.type,
+          name: currentChunk.name,
+          language,
+        });
+      }
+
+      // If no chunks found, add entire file as one chunk
+      if (chunks.length === 0) {
+        chunks.push({
+          code: content,
+          startLine: 1,
+          endLine: lines.length,
+          type: 'file',
+          language,
+        });
+      }
+    } else {
+      // Unknown language - just add entire file
+      chunks.push({
+        code: content,
+        startLine: 1,
+        endLine: lines.length,
+        type: 'file',
+        language,
+      });
+    }
+
+    return chunks;
+  }
+
+  /**
    * Index a single file
    */
   async indexFile(filePath: string): Promise<void> {
@@ -243,9 +453,12 @@ export class CodebaseIndexerService {
 
       // Remove old chunks for this file
       this.db.query('DELETE FROM code_chunks WHERE file_path = ?').run(filePath);
+      
+      // Note: Dependencies are now managed by madge in CodeGraphService
+      // We'll rebuild the graph after indexing
 
-      // Chunk the file using AST-based chunker
-      const chunks = this.chunker.chunkCode(content, language);
+      // Chunk the file using simple function/class detection
+      const chunks = this.chunkCode(content, language);
 
       // Generate embeddings and store
       const insertStmt = this.db.prepare(`
@@ -346,6 +559,13 @@ export class CodebaseIndexerService {
         if (indexed % 50 === 0) {
           logger.info({ indexed, total: files.length }, 'Indexing progress');
         }
+      }
+
+      // Rebuild code graph after indexing
+      try {
+        await this.codeGraph.buildGraph();
+      } catch (error) {
+        logger.warn({ error }, 'Failed to rebuild code graph');
       }
 
       // Update stats
@@ -580,7 +800,32 @@ export class CodebaseIndexerService {
   removeFile(filePath: string): void {
     const relativePath = relative(this.projectRoot, filePath);
     this.db.query('DELETE FROM code_chunks WHERE file_path = ?').run(filePath);
+    // Rebuild graph after removal
+    this.codeGraph.buildGraph().catch(error => {
+      logger.warn({ error }, 'Failed to rebuild graph after file removal');
+    });
     logger.debug({ file: relativePath }, 'File removed from index');
+  }
+
+  /**
+   * Get files that depend on a given file (reverse dependencies)
+   */
+  getDependents(filePath: string): string[] {
+    return this.codeGraph.getDependents(filePath).map(dep => join(this.projectRoot, dep));
+  }
+
+  /**
+   * Get files that a given file depends on
+   */
+  getDependencies(filePath: string): string[] {
+    return this.codeGraph.getDependencies(filePath);
+  }
+
+  /**
+   * Get all affected files when a file changes (transitive dependents)
+   */
+  getAffectedFiles(filePath: string): string[] {
+    return this.codeGraph.getAffectedFiles(filePath);
   }
 
   /**

@@ -12,8 +12,11 @@ const logger = createServiceLogger('rag-service');
 import { CodeRetrievalService } from './services/code-retrieval.service.js';
 import { EmbeddingService } from './services/embedding.service.js';
 import { QdrantService } from './services/qdrant/qdrant.service.js';
+import { CodebaseIndexerService } from './services/codebase-indexer.service.js';
+import { CodeGraphService } from './services/code-graph.service.js';
 import { sanitizeErrorForResponse } from './utils/log-sanitizer.js';
 import { defaultConfig } from './config/index.js';
+import { join, relative } from 'path';
 
 const PORT = parseInt(process.env.PORT || '3120', 10);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -22,6 +25,8 @@ let app: FastifyInstance;
 let codeRetrievalService: CodeRetrievalService;
 let embeddingService: EmbeddingService;
 let qdrantService: QdrantService;
+let codebaseIndexer: CodebaseIndexerService;
+let codeGraph: CodeGraphService;
 
 async function buildApp(): Promise<FastifyInstance> {
   const fastify = Fastify({
@@ -37,6 +42,12 @@ async function buildApp(): Promise<FastifyInstance> {
   qdrantService = new QdrantService();
   codeRetrievalService = new CodeRetrievalService();
 
+  // Initialize Code Graph service
+  const projectRoot = process.env.PROJECT_ROOT || process.cwd();
+  codeGraph = new CodeGraphService(projectRoot);
+  await codeGraph.initialize();
+  codebaseIndexer = new CodebaseIndexerService(projectRoot);
+
   // Initialize async components
   await codeRetrievalService.initialize();
 
@@ -50,7 +61,9 @@ async function buildApp(): Promise<FastifyInstance> {
       components: {
         embedding: 'ready',
         vectorDb: 'ready',
-        codeRetrieval: 'ready'
+        codeRetrieval: 'ready',
+        codeGraph: 'ready',
+        codebaseIndexer: 'ready'
       },
       config: {
         embeddingModel: defaultConfig.get('EMBEDDING_LLM_MODEL'),
@@ -333,6 +346,120 @@ async function buildApp(): Promise<FastifyInstance> {
       const sanitized = sanitizeErrorForResponse(error);
       logger.error({ error: sanitized, textLength: request.body?.text?.length }, 'Failed to generate embedding');
       return reply.code(500).send({ error: 'Internal Server Error', details: sanitized });
+    }
+  });
+
+  // ===== Code Graph Endpoints =====
+
+  // Get dependencies of a file
+  fastify.post<{
+    Body: {
+      filePath: string;
+    };
+  }>('/code-graph/dependencies', async (request, reply) => {
+    try {
+      const { filePath } = request.body;
+
+      if (!filePath) {
+        return reply.code(400).send({ error: 'filePath is required' });
+      }
+
+      const fullPath = join(projectRoot, filePath);
+      const dependencies = codebaseIndexer.getDependencies(fullPath);
+      const relativeDeps = dependencies.map(dep => {
+        const rel = relative(projectRoot, dep);
+        return rel.startsWith('..') ? dep : rel;
+      });
+
+      return {
+        success: true,
+        filePath,
+        dependencies: relativeDeps,
+      };
+    } catch (error: unknown) {
+      const sanitized = sanitizeErrorForResponse(error);
+      logger.error({ error: sanitized }, 'Failed to get dependencies');
+      return reply.code(500).send({ error: 'Internal Server Error', details: sanitized });
+    }
+  });
+
+  // Get dependents (reverse dependencies) of a file
+  fastify.post<{
+    Body: {
+      filePath: string;
+    };
+  }>('/code-graph/dependents', async (request, reply) => {
+    try {
+      const { filePath } = request.body;
+
+      if (!filePath) {
+        return reply.code(400).send({ error: 'filePath is required' });
+      }
+
+      const fullPath = join(projectRoot, filePath);
+      const dependents = codebaseIndexer.getDependents(fullPath);
+      const relativeDeps = dependents.map(dep => {
+        const rel = relative(projectRoot, dep);
+        return rel.startsWith('..') ? dep : rel;
+      });
+
+      return {
+        success: true,
+        filePath,
+        dependents: relativeDeps,
+      };
+    } catch (error: unknown) {
+      const sanitized = sanitizeErrorForResponse(error);
+      logger.error({ error: sanitized }, 'Failed to get dependents');
+      return reply.code(500).send({ error: 'Internal Server Error', details: sanitized });
+    }
+  });
+
+  // Get all affected files when a file changes
+  fastify.post<{
+    Body: {
+      filePath: string;
+    };
+  }>('/code-graph/affected', async (request, reply) => {
+    try {
+      const { filePath } = request.body;
+
+      if (!filePath) {
+        return reply.code(400).send({ error: 'filePath is required' });
+      }
+
+      const fullPath = join(projectRoot, filePath);
+      const affected = codebaseIndexer.getAffectedFiles(fullPath);
+      const relativeAffected = affected.map(aff => {
+        const rel = relative(projectRoot, aff);
+        return rel.startsWith('..') ? aff : rel;
+      });
+
+      return {
+        success: true,
+        filePath,
+        affectedFiles: relativeAffected,
+      };
+    } catch (error: unknown) {
+      const sanitized = sanitizeErrorForResponse(error);
+      logger.error({ error: sanitized }, 'Failed to get affected files');
+      return reply.code(500).send({ error: 'Internal Server Error', details: sanitized });
+    }
+  });
+
+  // Get all dependencies as a graph
+  fastify.get('/code-graph/all', async () => {
+    try {
+      const edges = codeGraph.getAllDependencies();
+      return {
+        success: true,
+        edges,
+        nodeCount: new Set([...edges.map(e => e.from), ...edges.map(e => e.to)]).size,
+      };
+    } catch (error: unknown) {
+      const sanitized = sanitizeErrorForResponse(error);
+      logger.error({ error: sanitized }, 'Failed to get code graph');
+      return { error: 'Internal Server Error', details: sanitized };
     }
   });
 
